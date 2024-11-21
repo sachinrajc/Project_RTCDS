@@ -1,0 +1,146 @@
+/*-----------------------------------------------------------------------------
+	File Name:	ELNC6007SRCLab6.c  
+	Author:		Sachin Raj Charupadikkal
+	Date:		31/10/2023
+	Modified:	None
+	© Fanshawe College, 2023
+
+	Description:
+-----------------------------------------------------------------------------*/
+
+
+/* Preprocessor ---------------------------------------------------------------
+   Hardware Configuration Bits ----------------------------------------------*/
+#pragma config FOSC		= INTIO67
+#pragma config PLLCFG	= OFF
+#pragma config PRICLKEN = ON
+#pragma config FCMEN	= OFF
+#pragma config IESO		= OFF
+#pragma config PWRTEN	= OFF 
+#pragma config BOREN	= ON
+#pragma config BORV		= 285 
+#pragma config WDTEN	= OFF
+#pragma config PBADEN	= OFF
+#pragma config LVP		= OFF
+#pragma config MCLRE	= EXTMCLR
+
+// Libraries ------------------------------------------------------------------
+#include <stdio.h>
+#include <stdlib.h>
+#include <delays.h>   // Include delay header for Delay10KTCYx()
+
+#include <usart.h>
+
+
+// Constants  -----------------------------------------------------------------
+#define TRUE	1	
+#define FALSE	0	
+#define PWR_PIN	LATDbits.LATD3
+
+// Function prototypes --------------------------------------------------------
+void setOSC4MHZ();
+void systemInitialization(void);
+void configSerialPort(void);
+void powerOnSIM7000G(void);
+void sendATCommand(const char *command);
+void sendSMS(void);
+
+void setOSC4MHZ(void)
+{
+	OSCCON = 0x52;
+	while(!OSCCONbits.HFIOFS);
+} // eo setOSC4MHZ::
+
+void setPorts(void)
+{
+	ANSELC = 0x00;
+	TRISC = 0xC0;	
+
+	ANSELD = 0x00;
+	TRISD = 0x00;
+} // eo setPorts::
+
+
+void configSerialPort() {
+    BAUDCON1 = 0x40;   // BRG16 = 1
+    TXSTA1 = 0x26;     // TXEN = 1, BRGH = 1
+    RCSTA1 = 0x90;     // SPEN = 1, CREN = 1
+    SPBRG1 = 25; // Baud rate set for 9600
+    SPBRGH1 = 0x00;
+}
+
+void systemInitialization(void) 
+{
+	setOSC4MHZ();
+	setPorts();
+    configSerialPort();
+}
+
+
+void powerOnSIM7000G(void) 
+{
+    PWR_PIN = 0;              // Pull PWR pin low to power on the SIM7000G module
+    Delay10KTCYx(100);        // Hold for 1 second
+    PWR_PIN = 1;              // Release the PWR pin
+    Delay10KTCYx(300);        // Wait for module to initialize
+}
+
+// Send an AT command and wait for response
+void sendATCommand(const char *command) 
+{
+	putrs1USART(command);
+    putrs1USART("\r\n");  // Append "\r\n" for the modem
+    Delay10KTCYx(10);     // Small delay after sending command
+    Delay10KTCYx(10);  // Small delay after sending command
+
+}
+
+// Function to send an SMS with a static message
+void sendSMS(void) 
+{
+    char *str[35];        // Corrected to a character array
+    sprintf(str, "Hello! This is a test message from SIM7000G\n\r");
+    sendATCommand("AT+CMGS=\"+14382330707\"");  // Send SMS command
+    Delay10KTCYx(200);    // Wait for prompt
+    puts1USART(str);      // Send message content
+    putc1USART(26);       // Send CTRL+Z (ASCII 26) to end SMS
+    Delay10KTCYx(200);
+}
+
+
+// Main function
+void main(void) 
+{
+
+	char *str[35],c=0;        // Corrected to a character array
+    systemInitialization();
+	powerOnSIM7000G();
+
+    // Basic initialization and signal check
+    sendATCommand("AT");           // Basic communication check
+    Delay10KTCYx(200);
+    sendATCommand("AT+CSQ");       // Check signal quality
+    Delay10KTCYx(200);
+    sendATCommand("AT+CREG?");     // Check network registration
+    Delay10KTCYx(200);
+	sendATCommand("AT+CMGF=1");         // Disable command echo
+    Delay10KTCYx(200);
+    // Send SMS with a static message
+
+  // Set APN for the network provider 
+	sendATCommand("AT+CGDCONT=1,\"IP\",\"chatrweb.apn\"");  
+
+    Delay10KTCYx(100);    
+	//sendSMS();
+
+    while(1){
+      
+    sprintf(str, "Count = %d", c);
+	c++;
+    sendATCommand("AT+CMGS=\"+14382330707\"");  // Send SMS command
+    Delay10KTCYx(200);    // Wait for prompt
+    puts1USART(str);      // Send message content
+    putc1USART(26);       // Send CTRL+Z (ASCII 26) to end SMS
+    Delay10KTCYx(200);
+}
+}
