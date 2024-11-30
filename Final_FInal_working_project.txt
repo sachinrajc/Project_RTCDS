@@ -1,0 +1,540 @@
+/*=============================================================================
+	File Name:	ELNC6007SRCLab7.c  
+	Author:		Sachin Raj Charupadikkal
+	Date:		19/07/2024
+	Modified:	None
+	© Fanshawe College, 2024
+
+	Description:Configuring, programming and compiling the microcontroller for interrupting 
+				the timer running when the string is received from the keyboard input. And
+				displays the output in the Tera Term application.
+				Microcontroller used is PIC18F45K22
+=============================================================================*/
+
+/* Preprocessor ===============================================================
+   Hardware Configuration Bits ==============================================*/
+#pragma config FOSC       = INTIO67
+#pragma config PLLCFG     = OFF
+#pragma config PRICLKEN   = ON
+#pragma config FCMEN      = OFF
+#pragma config IESO       = OFF
+#pragma config PWRTEN     = OFF 
+#pragma config BOREN      = ON
+#pragma config BORV       = 285 
+#pragma config WDTEN      = OFF
+#pragma config PBADEN     = OFF
+#pragma config LVP        = OFF
+#pragma config MCLRE      = EXTMCLR
+
+// Libraries ==================================================================
+#include <p18f45k22.h>
+#include <stdio.h>
+#include <string.h>
+#include <delays.h> 
+#include <usart.h>
+
+// Constants  =================================================================
+#define TRUE            1    
+#define FALSE           0    
+
+#define GPS_BUFFER_SIZE 128
+#define GPGGA_HEADER    "$GPGGA"
+#define TOKENSIZE		15
+//GSM
+#define PWR_PIN	LATDbits.LATD3
+
+#define TILT_INPUT		PORTCbits.RC4   // Tilt sensor input pin (RB2)
+#define IR_SENSOR		PORTBbits.RB3   // Crack detection sensor input pin (RB3)
+#define TRIGGERPIN		LATBbits.LATB0  // Ultrasonic trigger pin (RB0)
+#define ECHOPIN 		PORTBbits.RB1   // Ultrasonic echo pin (RB1)
+#define TILT_LED		LATDbits.LATD2  // LED output pin for tilt sensor (RD2)
+#define IR_LED			LATDbits.LATD0  // LED output pin for crack sensor (RD0)
+#define UR_LED			LATDbits.LATD1  // LED output pin for ultrasonic sensor (RD1)
+#define MOTOR			LATDbits.LATD4  // Motor control pin (RD3)
+#define PBMASK			0x10
+#define PB1		0x00
+#define INITIAL_LED		LATCbits.LATC3	//LED output for AT commands running time
+// Global Variables  ==========================================================
+char rcBuf[GPS_BUFFER_SIZE];  // Buffer to store GPS data
+unsigned char insert = 0;     // Index for data insertion
+char sentenceReady = FALSE;
+char gpsReady=FALSE;
+char GPGGA[6]="GPRMC";
+char *tokens[TOKENSIZE];
+
+char *latitude = "N/A";
+char *latDir = "N/A";
+char *longitude = "N/A";
+char *longDir = "N/A";
+
+unsigned int distance;     // Variable to store the measured distance
+unsigned int pulseDuration;
+
+
+// Function Prototypes ========================================================
+void setOSC4MHZ(void);
+void setPorts(void);
+void configSerialPort2(void);
+void configINTS(void);
+void systemInitialization(void);
+
+void parseSent(char *ptr);
+void exeSent();
+void isr(void);
+
+void configSerialPort(void);
+void powerOnSIM7000G(void);
+void sendATCommand(const char *command);
+void sendSMS(char *msg[35]);
+
+// Interrupt Vector  ==========================================================
+#pragma code interruptVector = 0x0008
+void interruptVector()
+{
+    _asm
+    GOTO isr
+    _endasm    
+}
+
+#pragma code  // save following in normal code space
+
+// Functions ==================================================================
+
+/*>>> config4MHZ: ===========================================================
+Author:		Sachin Raj Charupadikkal
+Date:		17/05/2024
+Modified:	None
+Desc:		Setting the microcontroller oscillator frequency to 4MHZ
+Input: 		None
+Returns:	None 
+ ============================================================================*/
+void setOSC4MHZ(void)
+{
+    OSCCON = 0x52;
+    while (!OSCCONbits.HFIOFS);
+} // eo setOSC4MHZ::
+
+/*>>> configPorts: ===========================================================
+Author:		Sachin Raj Charupadikkal
+Date:		24/05/2024
+Modified:	None
+Desc:		Setting the PORTA for pushbutton input, PORTD for LED output and set rest 
+			of the ports to default configuration as Digital Input.
+Input: 		None
+Returns:	None 
+ ============================================================================*/
+void setPorts(void)
+{
+	ANSELA = 0x00;
+	LATA = 0x00;
+	TRISA = 0xFF;
+
+	ANSELB = 0x00;	// Set PORTB as digital I/O
+	TRISB = 0x0E;	// Set RB0 (Ultrasonic trigger) as output, RB1-RB3 as inputs
+	LATB = 0x00;
+
+	ANSELC = 0x00;
+	//LATC = 0x00;	
+	TRISC = 0xD0;	
+
+
+	ANSELD = 0x00;  // Set PORTD as digital I/O
+	TRISD = 0x00;	// Set all PORTD pins as outputs
+	LATD = 0xC0;    // UART, Initialize PORTD (all LEDs and motor off initially)  
+} // eo setPorts::
+
+void configSerialPort() 
+{
+    BAUDCON1 = 0x40;   // BRG16 = 1
+    TXSTA1 = 0x26;     // TXEN = 1, BRGH = 1
+    RCSTA1 = 0x90;     // SPEN = 1, CREN = 1
+    SPBRG1 = 25; // Baud rate set for 9600
+    SPBRGH1 = 0x00;
+}
+
+
+/*>>> configTMR0: -------------------------------------------------------------
+Author:		
+Date:		
+Modified:	None
+Desc:		
+Input: 		None 
+Returns:	None 
+----------------------------------------------------------------------------*/
+void configTMR0(void) 
+{
+	T0CON = 0x88;  // Enable Timer0, 16-bit mode, 1:1 prescaler
+	TMR0H = 0;     // Reset Timer0 high byte
+	TMR0L = 0;     // Reset Timer0 low byte
+}// eo configTMR0::
+
+/*>>> readTMR0: -------------------------------------------------------------
+Author:		
+Date:		
+Modified:	None
+Desc:		
+Input: 		None 
+Returns:	None 
+----------------------------------------------------------------------------*/
+unsigned int readTMR0(void) 
+{
+	unsigned char lowByte = TMR0L;  // Read low byte
+	unsigned char highByte = TMR0H;  // Read high byte
+	return ((unsigned int)highByte << 8) | lowByte;  // Combine to 16-bit value
+}//eo readTMR0::
+
+/*>>> measureDistance: -------------------------------------------------------------
+Author:		
+Date:		
+Modified:	None
+Desc:		
+Input: 		None 
+Returns:	None 
+----------------------------------------------------------------------------*/
+void measureDistance(void) 
+{
+	TRIGGERPIN = 1;  // Set trigger pin high
+	Delay10TCYx(10);  // Delay for 10us
+	TRIGGERPIN = 0;  // Set trigger pin low
+
+	// Wait for the echo pin to go high
+	while (!ECHOPIN);
+
+	// Start Timer0
+	TMR0H = 0;
+	TMR0L = 0;
+	T0CONbits.TMR0ON = 1;  // Turn on Timer0
+
+	// Wait for the echo pin to go low
+	while (ECHOPIN);
+	T0CONbits.TMR0ON = 0;  // Stop Timer0
+
+	// Calculate distance in cm
+	pulseDuration = readTMR0();
+	distance = (pulseDuration * 0.034) / 2;
+
+	// Control LED based on distance
+	UR_LED = (distance < 20) ? 1 : 0;
+}//eo measureDistance::
+
+/*>>> checkTiltSensor: -------------------------------------------------------------
+Author:		
+Date:		
+Modified:	None
+Desc:		
+Input: 		None 
+Returns:	None 
+----------------------------------------------------------------------------*/
+void checkTiltSensor(void)
+{
+	if(!TILT_INPUT)
+	{
+		TILT_LED=0;
+	}
+	else
+	{
+		TILT_LED=1;
+	}
+	 //TILT_LED= (TILT_INPUT == 1) ? 0 : 1;  // Turn on LED if tilt detected
+ }//e0 checkTiltSensor::
+
+/*>>> checkCrackSensor: -------------------------------------------------------------
+Author:		
+Date:		29/09/2024
+Modified:	None
+Desc:		
+Input: 		None 
+Returns:	None 
+----------------------------------------------------------------------------*/
+void checkCrackSensor(void)
+{
+	IR_LED = (IR_SENSOR == 1) ? 1 : 0;  // Turn on LED if crack detected
+}
+
+
+/*>>> configSerialPort: =======================================================
+Author:		Sachin Raj Charupadikkal
+Date:		21/06/2024
+Modified:	None
+Desc:		Serial port on, TX & RX enabled, 8bit transmission, No parity, 
+			9600 baud rate.
+Input: 		None
+Returns:	None 
+ ============================================================================*/
+void configSerialPort2(void)
+{
+    BAUDCON2 = 0x40;  // BRG16 = 1
+    TXSTA2 = 0x26;    // TXEN = 1, SYNC = 0, BRGH = 1
+    RCSTA2 = 0x90;    // SPEN = 1, CREN = 1
+    SPBRG2 = 25;      // Baud rate = 9600 for Fosc = 4 MHz
+    SPBRGH2 = 0x00;
+} // eo configSerialPort::
+
+/*>>> configINTS: ===========================================================
+Author:		Sachin Raj Charupadikkal
+Date:		19/07/2024
+Modified:	None
+Desc:		
+Input: 		None
+Returns:	None 
+ ============================================================================*/
+void configINTS(void)
+{
+    PIE3bits.RC2IE = FALSE;       // USART 2 Receiver Interrupt enabled
+    INTCONbits.GIE = TRUE;       // Global Interrupt Enable
+    INTCONbits.PEIE = TRUE;      // Peripheral Interrupt Enable
+} // eo configINTS::
+
+/*>>> systemInitialization: ===========================================================
+Author:		Sachin Raj Charupadikkal
+Date:		07/06/2024
+Modified:	Added configSP1 function. 21/06/2024
+Desc:		Calling the configuration functions such as frequency, ports and configTMR0 
+			in a single function.
+Input: 		None
+Returns:	None 
+ ============================================================================*/
+void systemInitialization(void)
+{
+    setOSC4MHZ();
+    setPorts();
+	configTMR0();
+	configSerialPort();
+    configSerialPort2();
+    configINTS();
+} // eo systemInitialization::
+
+// Parse Sentence into Tokens
+void parseSent(char *ptr)
+{
+    char tokenCount=0;
+    while(*ptr && tokenCount < TOKENSIZE){
+        if(*ptr == '$' || *ptr == ',')
+		{
+            *ptr='\0';
+            tokens[tokenCount]=ptr+1;
+            tokenCount++;
+        }
+        ptr++;
+    }
+}
+
+
+// Execute and Print Latitude and Longitude
+void exeSent()
+{
+    //printf("\n\rReceived GPS sentence: %s\n", rcBuf); // Print the entire sentence
+
+    if (strcmp(GPGGA,tokens[0])==0) // Check if sentence starts with $GPGGA
+    {
+
+		// stop usart to avoid this msg getting overwritten
+		PIE3bits.RC2IE = FALSE;
+		gpsReady=TRUE; // set gps data Ready flag
+        // Extract Latitude and Longitude
+        latitude = tokens[3];     // Latitude value
+        latDir = tokens[4];       // N/S direction
+        longitude = tokens[5];    // Longitude value
+        longDir = tokens[6];      // E/W direction
+        // Print the parsed values
+        // printf("Location: %s%s %s%s\n\r", latitude, latDir, longitude, longDir);
+    }
+}
+
+// Interrupt Service Routine
+#pragma interrupt isr
+void isr(void)
+{
+    if (PIR3bits.RC2IF)  
+    {
+        char receivedChar = RCREG2;
+
+        // Reset buffer index if new data starts
+        if (receivedChar == '$')
+        {
+            insert = 0;
+        }
+
+        // Store character in buffer
+        if (insert < GPS_BUFFER_SIZE - 1) // Prevent overflow
+        {
+            rcBuf[insert++] = receivedChar;
+        }
+
+        // Check for end of sentence
+        if (receivedChar == '\n')
+        {
+            rcBuf[insert] = '\0';   // Null-terminate the buffer
+            sentenceReady = TRUE;  // Set flag for processing in main
+        }
+    }
+}
+
+
+void powerOnSIM7000G(void) 
+{
+    PWR_PIN = 0;              // Pull PWR pin low to power on the SIM7000G module
+    Delay10KTCYx(100);        // Hold for 1 second
+    PWR_PIN = 1;              // Release the PWR pin
+    Delay10KTCYx(300);        // Wait for module to initialize
+}
+
+// Send an AT command and wait for response
+void sendATCommand(const char *command) 
+{
+	putrs1USART(command);
+    putrs1USART("\r\n");  // Append "\r\n" for the modem
+    Delay10KTCYx(10);     // Small delay after sending command
+    Delay10KTCYx(10);  // Small delay after sending command
+}
+
+// Function to send an SMS with a static message
+void sendSMS(char *msg[35]) 
+{
+	INITIAL_LED = 1;
+    sendATCommand("AT+CMGS=\"+14382330707\"");  // Send SMS command
+    Delay10KTCYx(200);    // Wait for prompt
+    puts1USART(msg);      // Send message content
+    putc1USART(26);       // Send CTRL+Z (ASCII 26) to end SMS
+	INITIAL_LED = 0;
+//    Delay10KTCYx(200);
+//    Delay10KTCYx(200);
+}
+
+void processGPSData(void)
+{
+    if (sentenceReady)
+    {
+        sentenceReady = FALSE;
+        parseSent(rcBuf);
+        exeSent();
+    }
+}
+/*>>> motorAction: -------------------------------------------------------------
+Author:		Sachin Raj Charupadikkal
+Date:		29/09/2024
+Modified:	None
+Desc:		Ports setting for pin.
+Input: 		None 
+Returns:	None 
+----------------------------------------------------------------------------*/
+void motorAction(void)
+{
+    //char message[100];
+	char *str[35],c=0;        // Corrected to a character array
+	// Stop motor if any LED is on (indicating a sensor is triggered)
+	if (UR_LED == 1 || TILT_LED == 1 || IR_LED == 1) 
+	{
+		MOTOR = 0;  // Stop motor
+
+		// Clear any overflow error 
+		if (RCSTA2bits.OERR)
+		{
+			RCSTA2bits.CREN=0;
+			RCSTA2bits.CREN=1;	
+		}
+		// Enable USART to receive GPS	
+		PIE3bits.RC2IE = TRUE;
+		gpsReady=FALSE;
+		// execute until you get GPS data
+		while(!gpsReady)
+		{
+			processGPSData();
+		}
+
+        Delay10KTCYx(100);  // Delay for GPS data update
+		if (UR_LED == 1) 
+		{
+			sprintf(str,  "Fault: Obstacle\r\n");
+			if (TILT_LED == 1) 
+			{
+				sprintf(str,  "%sFault: Tilted\r\n",str);
+				if (IR_LED == 1) 
+				{
+					sprintf(str,  "%sFault: Crack\r\n",str);
+				}
+			}
+			else if (IR_LED == 1) 
+			{
+				sprintf(str,  "%sFault: Crack\r\n",str);
+			}
+		}
+		else if (TILT_LED == 1) 
+		{
+			sprintf(str,  "Fault: Tilted\r\n");
+			if (IR_LED == 1) 
+			{
+				sprintf(str,  "%sFault: Crack\r\n",str);
+			}
+		}
+		else if (IR_LED == 1) 
+		{
+			sprintf(str,  "Fault: Crack\r\n");
+		}
+		sprintf(str,  "%sLocation: %s%s, %s%s",str, latitude, latDir, longitude, longDir);
+		
+		sendSMS(str);
+	}
+	else
+	{
+	
+	}
+
+}//eo motorAction::
+// Main Function
+void main(void)
+{
+	char pbState = 0;
+	INITIAL_LED = 1;
+	systemInitialization();  // Initialize system
+
+    powerOnSIM7000G();
+    // Basic initialization and signal check
+    sendATCommand("AT");           // Basic communication check
+    Delay10KTCYx(200);
+    sendATCommand("AT+CSQ");       // Check signal quality
+    Delay10KTCYx(200);
+    sendATCommand("AT+CREG?");     // Check network registration
+    Delay10KTCYx(200);
+	sendATCommand("AT+CMGF=1");         // Disable command echo
+    Delay10KTCYx(200);
+
+	sendATCommand("AT");           // Basic communication check
+    Delay10KTCYx(200);
+    sendATCommand("AT+CSQ");       // Check signal quality
+    Delay10KTCYx(200);
+    sendATCommand("AT+CREG?");     // Check network registration
+    Delay10KTCYx(200);
+	sendATCommand("AT+CMGF=1");         // Disable command echo
+    Delay10KTCYx(200);
+    // Send SMS with a static message
+
+  // Set APN for the network provider 
+	sendATCommand("AT+CGDCONT=1,\"IP\",\"chatrweb.apn\"");  
+    Delay10KTCYx(200);
+	INITIAL_LED = 0;
+
+
+	MOTOR = 0;  // Motor off initially
+	
+	while(TRUE)
+	{
+
+		// pushbutton
+		// when pushbutton prssed, toggle motor
+		pbState = PORTA&PBMASK;
+		if(pbState == PB1)
+		{
+			MOTOR=~MOTOR;// toggle motor state
+		}
+		if(MOTOR)
+		{
+			measureDistance();       // Measure distance using ultrasonic sensor
+			checkTiltSensor();       // Check tilt sensor
+			checkCrackSensor();      // Check crack detection sensor
+			motorAction();  // Stop motor if any sensor is triggered
+		}
+		Delay10KTCYx(50);  // Small delay for stability
+	}
+}
+
